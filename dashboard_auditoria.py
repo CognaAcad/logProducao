@@ -24,7 +24,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📊 Dashboard de Auditoria SharePoint")
+st.title("📊 Dashboard Esteira de Produção - TI")
 
 st.caption(
     "Auditoria das entregas, controle de produção "
