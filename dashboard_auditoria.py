@@ -3,6 +3,8 @@ import json
 import hashlib
 import hmac
 import sqlite3
+import base64
+import requests
 from io import BytesIO
 from pathlib import Path
 from datetime import timedelta, datetime, date
@@ -718,45 +720,214 @@ def descobrir_disciplina_automatica(
 # MAPEAMENTO
 # ==========================================================
 
-def carregar_mapeamento():
+def configuracao_github_disponivel():
+
+    try:
+        return (
+            "github" in st.secrets
+            and bool(st.secrets["github"].get("token"))
+            and bool(st.secrets["github"].get("owner"))
+            and bool(st.secrets["github"].get("repo"))
+        )
+    except Exception:
+        return False
+
+
+def configuracao_github():
+
+    if not configuracao_github_disponivel():
+        return None
+
+    return {
+        "token": st.secrets["github"]["token"],
+        "owner": st.secrets["github"]["owner"],
+        "repo": st.secrets["github"]["repo"],
+        "branch": st.secrets["github"].get(
+            "branch",
+            "main"
+        ),
+        "arquivo": st.secrets["github"].get(
+            "arquivo_mapeamento",
+            "mapeamento_bibliotecas.json"
+        ),
+    }
+
+
+def obter_headers_github():
+
+    config = configuracao_github()
+
+    if config is None:
+        return {}
+
+    return {
+        "Authorization": f"Bearer {config['token']}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def carregar_mapeamento_local():
 
     if not ARQUIVO_MAPEAMENTO.exists():
-
         return {}
 
     try:
-
         with open(
             ARQUIVO_MAPEAMENTO,
             "r",
             encoding="utf-8"
         ) as arquivo:
-
-            return json.load(
-                arquivo
-            )
-
+            return json.load(arquivo)
     except Exception:
-
         return {}
 
 
-def salvar_mapeamento(
-    mapa
-):
+def salvar_mapeamento_local(mapa):
 
     with open(
         ARQUIVO_MAPEAMENTO,
         "w",
         encoding="utf-8"
     ) as arquivo:
-
         json.dump(
             mapa,
             arquivo,
             ensure_ascii=False,
             indent=4
         )
+
+
+def carregar_mapeamento_github():
+    """Lê mapeamento_bibliotecas.json diretamente do GitHub."""
+
+    config = configuracao_github()
+
+    if config is None:
+        return carregar_mapeamento_local()
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{config['owner']}/"
+        f"{config['repo']}/contents/"
+        f"{config['arquivo']}"
+    )
+
+    resposta = requests.get(
+        url,
+        headers=obter_headers_github(),
+        params={"ref": config["branch"]},
+        timeout=20
+    )
+
+    if resposta.status_code == 404:
+        return carregar_mapeamento_local()
+
+    resposta.raise_for_status()
+
+    dados = resposta.json()
+
+    conteudo_base64 = dados.get("content", "")
+
+    if not conteudo_base64:
+        return {}
+
+    conteudo = base64.b64decode(
+        conteudo_base64
+    ).decode("utf-8")
+
+    return json.loads(conteudo)
+
+
+def salvar_mapeamento_github(mapa):
+    """Cria/atualiza mapeamento_bibliotecas.json no GitHub."""
+
+    config = configuracao_github()
+
+    # Execução local sem Secrets: mantém o comportamento antigo.
+    if config is None:
+        salvar_mapeamento_local(mapa)
+        return True, "local"
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{config['owner']}/"
+        f"{config['repo']}/contents/"
+        f"{config['arquivo']}"
+    )
+
+    headers = obter_headers_github()
+
+    resposta_atual = requests.get(
+        url,
+        headers=headers,
+        params={"ref": config["branch"]},
+        timeout=20
+    )
+
+    sha_atual = None
+
+    if resposta_atual.status_code == 200:
+        sha_atual = resposta_atual.json().get("sha")
+    elif resposta_atual.status_code != 404:
+        resposta_atual.raise_for_status()
+
+    conteudo_json = json.dumps(
+        mapa,
+        ensure_ascii=False,
+        indent=4
+    )
+
+    conteudo_base64 = base64.b64encode(
+        conteudo_json.encode("utf-8")
+    ).decode("utf-8")
+
+    payload = {
+        "message": "Atualiza nomes das disciplinas pelo Streamlit",
+        "content": conteudo_base64,
+        "branch": config["branch"],
+    }
+
+    if sha_atual:
+        payload["sha"] = sha_atual
+
+    resposta = requests.put(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=20
+    )
+
+    resposta.raise_for_status()
+
+    # Mantém também uma cópia local durante a sessão atual.
+    salvar_mapeamento_local(mapa)
+
+    return True, "github"
+
+
+def carregar_mapeamento():
+
+    try:
+        return carregar_mapeamento_github()
+    except Exception as erro:
+        st.warning(
+            "Não foi possível carregar o mapeamento do GitHub. "
+            f"Será usada a cópia local, se existir. Erro: {erro}"
+        )
+        return carregar_mapeamento_local()
+
+
+def salvar_mapeamento(mapa):
+
+    try:
+        return salvar_mapeamento_github(mapa)
+    except Exception as erro:
+        st.error(
+            "Não foi possível salvar o mapeamento no GitHub. "
+            f"Erro: {erro}"
+        )
+        return False, "erro"
 
 
 def criar_tabela_mapeamento(
@@ -3088,24 +3259,32 @@ with tab_config:
                     biblioteca
                 ] = disciplina
 
-            salvar_mapeamento(
+            salvou, destino = salvar_mapeamento(
                 novo_mapa
             )
 
-            if (
-                "controle_producao"
-                in st.session_state
-            ):
+            if salvou:
 
-                del st.session_state[
+                if (
                     "controle_producao"
-                ]
+                    in st.session_state
+                ):
 
-            st.success(
-                "✅ Nomes salvos."
-            )
+                    del st.session_state[
+                        "controle_producao"
+                    ]
 
-            st.rerun()
+                if destino == "github":
+                    st.success(
+                        "✅ Nomes salvos no GitHub com sucesso."
+                    )
+                else:
+                    st.success(
+                        "✅ Nomes salvos localmente. "
+                        "Configure os Secrets do GitHub para persistência no Streamlit Cloud."
+                    )
+
+                st.rerun()
 
 
         st.divider()
