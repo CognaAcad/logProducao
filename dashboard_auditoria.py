@@ -54,6 +54,14 @@ ARQUIVO_RESPONSAVEIS = Path(
 )
 
 
+# Link direto para download do arquivo de backup no GitHub.
+URL_BACKUP = (
+    "https://raw.githubusercontent.com/"
+    "CognaAcad/logProducao/main/"
+    "auditoria_sharepoint_seleniumv4.xlsx"
+)
+
+
 # ==========================================================
 # ACESSO ADMINISTRATIVO
 # ==========================================================
@@ -2174,8 +2182,8 @@ ultima_importacao = (
 
 if ultima_importacao:
 
-    info1, info2 = st.columns(
-        2
+    info1, info2, info3 = st.columns(
+        [2.5, 2.0, 1.0]
     )
 
     info1.caption(
@@ -2187,6 +2195,17 @@ if ultima_importacao:
         "🕒 Última importação: "
         f"{ultima_importacao['data_importacao']}"
     )
+
+    with info3:
+        st.link_button(
+            "⬇️ Backup",
+            URL_BACKUP,
+            use_container_width=True,
+            help=(
+                "Baixar o arquivo de backup da auditoria "
+                "diretamente do GitHub."
+            ),
+        )
 
 
 # ==========================================================
