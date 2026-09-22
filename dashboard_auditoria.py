@@ -49,6 +49,11 @@ ARQUIVO_MAPEAMENTO = Path(
 )
 
 
+ARQUIVO_RESPONSAVEIS = Path(
+    "responsaveis_disciplinas.json"
+)
+
+
 # ==========================================================
 # ACESSO ADMINISTRATIVO
 # ==========================================================
@@ -97,6 +102,7 @@ COLUNAS_CONTROLE = [
     "Revisor e-mail",
     "Autor",
     "Autor e-mail",
+    "Responsável",
     "Disciplina",
     "Unidade",
     "Aula",
@@ -684,34 +690,48 @@ def extrair_disciplina_dos_arquivos(
 def descobrir_disciplina_automatica(
     grupo
 ):
+    """
+    Prioridade para identificar a disciplina:
+    1. coluna Disciplina gerada pelo robô Selenium/SharePoint;
+    2. nome extraído dos arquivos encontrados;
+    3. vazio, para permitir os fallbacks antigos.
+    """
 
+    # ------------------------------------------------------
+    # 1. NOME VINDO DIRETAMENTE DO SHAREPOINT
+    # ------------------------------------------------------
+    if "Disciplina" in grupo.columns:
+        candidatas_sharepoint = []
+
+        for valor in grupo["Disciplina"]:
+            nome = str(valor).strip()
+
+            if not nome:
+                continue
+
+            # Ignora placeholders antigos como Biblioteca 1.
+            if re.fullmatch(r"Biblioteca\s*\d+", nome, flags=re.IGNORECASE):
+                continue
+
+            candidatas_sharepoint.append(nome.upper())
+
+        if candidatas_sharepoint:
+            return pd.Series(candidatas_sharepoint).mode().iloc[0]
+
+    # ------------------------------------------------------
+    # 2. FALLBACK: EXTRAI DO NOME DOS ARQUIVOS
+    # ------------------------------------------------------
     disciplinas = []
 
-    for arquivos in grupo[
-        "Arquivos encontrados"
-    ]:
+    if "Arquivos encontrados" in grupo.columns:
+        for arquivos in grupo["Arquivos encontrados"]:
+            disciplina = extrair_disciplina_dos_arquivos(arquivos)
 
-        disciplina = (
-            extrair_disciplina_dos_arquivos(
-                arquivos
-            )
-        )
-
-        if disciplina:
-
-            disciplinas.append(
-                disciplina
-            )
+            if disciplina:
+                disciplinas.append(disciplina)
 
     if disciplinas:
-
-        return (
-            pd.Series(
-                disciplinas
-            )
-            .mode()
-            .iloc[0]
-        )
+        return pd.Series(disciplinas).mode().iloc[0]
 
     return ""
 
@@ -930,6 +950,203 @@ def salvar_mapeamento(mapa):
         return False, "erro"
 
 
+def _config_arquivo_github(nome_secret, padrao):
+
+    config = configuracao_github()
+
+    if config is None:
+        return None
+
+    try:
+        arquivo = st.secrets["github"].get(nome_secret, padrao)
+    except Exception:
+        arquivo = padrao
+
+    novo = dict(config)
+    novo["arquivo"] = arquivo
+    return novo
+
+
+def carregar_json_local(caminho):
+
+    caminho = Path(caminho)
+
+    if not caminho.exists():
+        return {}
+
+    try:
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+            return dados if isinstance(dados, dict) else {}
+    except Exception:
+        return {}
+
+
+def salvar_json_local(caminho, dados):
+
+    with open(caminho, "w", encoding="utf-8") as arquivo:
+        json.dump(dados, arquivo, ensure_ascii=False, indent=4)
+
+
+def carregar_json_github(nome_secret, padrao, caminho_local):
+
+    config = _config_arquivo_github(nome_secret, padrao)
+
+    if config is None:
+        return carregar_json_local(caminho_local)
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{config['owner']}/"
+        f"{config['repo']}/contents/"
+        f"{config['arquivo']}"
+    )
+
+    resposta = requests.get(
+        url,
+        headers=obter_headers_github(),
+        params={"ref": config["branch"]},
+        timeout=20,
+    )
+
+    if resposta.status_code == 404:
+        return carregar_json_local(caminho_local)
+
+    resposta.raise_for_status()
+    dados = resposta.json()
+    conteudo_base64 = dados.get("content", "")
+
+    if not conteudo_base64:
+        return {}
+
+    conteudo = base64.b64decode(conteudo_base64).decode("utf-8")
+    resultado = json.loads(conteudo)
+    return resultado if isinstance(resultado, dict) else {}
+
+
+def salvar_json_github(nome_secret, padrao, caminho_local, dados, mensagem):
+
+    config = _config_arquivo_github(nome_secret, padrao)
+
+    if config is None:
+        salvar_json_local(caminho_local, dados)
+        return True, "local"
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{config['owner']}/"
+        f"{config['repo']}/contents/"
+        f"{config['arquivo']}"
+    )
+
+    headers = obter_headers_github()
+    resposta_atual = requests.get(
+        url,
+        headers=headers,
+        params={"ref": config["branch"]},
+        timeout=20,
+    )
+
+    sha_atual = None
+    if resposta_atual.status_code == 200:
+        sha_atual = resposta_atual.json().get("sha")
+    elif resposta_atual.status_code != 404:
+        resposta_atual.raise_for_status()
+
+    conteudo_json = json.dumps(dados, ensure_ascii=False, indent=4)
+    conteudo_base64 = base64.b64encode(
+        conteudo_json.encode("utf-8")
+    ).decode("utf-8")
+
+    payload = {
+        "message": mensagem,
+        "content": conteudo_base64,
+        "branch": config["branch"],
+    }
+
+    if sha_atual:
+        payload["sha"] = sha_atual
+
+    resposta = requests.put(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=20,
+    )
+    resposta.raise_for_status()
+    salvar_json_local(caminho_local, dados)
+    return True, "github"
+
+
+def carregar_responsaveis():
+
+    try:
+        return carregar_json_github(
+            "arquivo_responsaveis",
+            "responsaveis_disciplinas.json",
+            ARQUIVO_RESPONSAVEIS,
+        )
+    except Exception as erro:
+        st.warning(
+            "Não foi possível carregar Autor/Responsável do GitHub. "
+            f"Será usada a cópia local, se existir. Erro: {erro}"
+        )
+        return carregar_json_local(ARQUIVO_RESPONSAVEIS)
+
+
+def salvar_responsaveis(dados):
+
+    try:
+        return salvar_json_github(
+            "arquivo_responsaveis",
+            "responsaveis_disciplinas.json",
+            ARQUIVO_RESPONSAVEIS,
+            dados,
+            "Atualiza autores e responsáveis pelo Streamlit",
+        )
+    except Exception as erro:
+        st.error(
+            "Não foi possível salvar Autor/Responsável no GitHub. "
+            f"Erro: {erro}"
+        )
+        return False, "erro"
+
+
+def normalizar_chave_disciplina(valor):
+
+    return re.sub(
+        r"\s+",
+        " ",
+        str(valor).strip().upper(),
+    )
+
+
+def aplicar_responsaveis_controle(controle, cadastro):
+
+    if controle is None or controle.empty:
+        return controle
+
+    controle = controle.copy()
+
+    for indice, row in controle.iterrows():
+        chave = normalizar_chave_disciplina(row.get("Disciplina", ""))
+        dados = cadastro.get(chave, {})
+
+        if not isinstance(dados, dict):
+            continue
+
+        autor = str(dados.get("autor", "")).strip()
+        responsavel = str(dados.get("responsavel", "")).strip()
+
+        if autor:
+            controle.at[indice, "Autor"] = autor
+
+        if responsavel:
+            controle.at[indice, "Responsável"] = responsavel
+
+    return controle
+
+
 def criar_tabela_mapeamento(
     df
 ):
@@ -961,9 +1178,11 @@ def criar_tabela_mapeamento(
             )
         )
 
+        # O nome detectado diretamente pelo SharePoint tem prioridade.
+        # O JSON fica apenas como fallback para relatórios antigos.
         disciplina_final = (
-            disciplina_salva
-            or automatica
+            automatica
+            or disciplina_salva
             or biblioteca
         )
 
@@ -1235,97 +1454,43 @@ def status_linha(
     etapas = []
 
     for coluna in COLUNAS_ETAPAS:
-
         if coluna not in row:
-
             continue
 
-        valor = str(
-            row[coluna]
-        ).strip()
+        valor = str(row[coluna]).strip()
 
-        if (
-            valor
-            and valor
-            != "Não se aplica"
-        ):
+        if valor and valor != "Não se aplica":
+            etapas.append(valor)
 
-            etapas.append(
-                valor
-            )
-
-    # ------------------------------------------------------
-    # CONCLUÍDO
-    # ------------------------------------------------------
-
-    if (
-        etapas
-        and all(
-            etapa == "Validado"
-            for etapa in etapas
-        )
-    ):
-
+    # Tudo aplicável validado.
+    if etapas and all(etapa == "Validado" for etapa in etapas):
         return "✅ Concluído"
 
-    # ------------------------------------------------------
-    # PRAZO
-    # ------------------------------------------------------
-
-    prazo = converter_data(
-        row.get(
-            "Prazo",
-            ""
-        )
-    )
-
-    hoje = pd.Timestamp(
-        date.today()
-    )
-
-    if pd.notna(
-        prazo
-    ):
-
-        diferenca = (
-            prazo.normalize()
-            - hoje
-        ).days
-
-        if diferenca < 0:
-
-            return "🔴 Atrasado"
-
-        if diferenca <= 2:
-
-            return (
-                "🟡 Próximo do prazo"
-            )
-
-    # ------------------------------------------------------
-    # EM ANDAMENTO
-    # ------------------------------------------------------
-
+    tem_validado = any(etapa == "Validado" for etapa in etapas)
     status_andamento = [
         "Em produção",
         "Em revisão",
         "Ajuste solicitado",
         "Aguardando",
     ]
+    tem_andamento = any(etapa in status_andamento for etapa in etapas)
 
-    if any(
-        etapa
-        in status_andamento
-        for etapa in etapas
-    ):
+    prazo = converter_data(row.get("Prazo", ""))
+    hoje = pd.Timestamp(date.today())
 
-        return "🔵 Em andamento"
+    if pd.notna(prazo):
+        diferenca = (prazo.normalize() - hoje).days
 
-    if any(
-        etapa == "Validado"
-        for etapa in etapas
-    ):
+        # Se já existe evidência de entrega/andamento, não chama de atrasado.
+        if diferenca < 0:
+            if tem_validado or tem_andamento:
+                return "🔵 Em andamento"
+            return "🔴 Atrasado"
 
+        if diferenca <= 2 and not (tem_validado or tem_andamento):
+            return "🟡 Próximo do prazo"
+
+    if tem_andamento or tem_validado:
         return "🔵 Em andamento"
 
     return "⚪ Não iniciado"
@@ -1454,6 +1619,10 @@ def criar_controle_inicial(
 
     controle[
         "Autor e-mail"
+    ] = ""
+
+    controle[
+        "Responsável"
     ] = ""
 
     for coluna in COLUNAS_ETAPAS:
@@ -1590,20 +1759,114 @@ def atualizar_disciplinas_controle(
     return controle
 
 
+def _valor_ok(valor):
+
+    return str(valor).strip().upper() == "OK"
+
+
+def sincronizar_auditoria_controle(controle, df_base):
+    """Promove etapas do controle para Validado quando a auditoria comprova o arquivo."""
+
+    if controle is None:
+        controle = pd.DataFrame(columns=COLUNAS_CONTROLE)
+
+    controle = controle.copy()
+
+    # Garante que novas linhas da auditoria também entrem no controle.
+    chaves_existentes = set()
+    for _, row in controle.iterrows():
+        chaves_existentes.add((
+            normalizar_chave_disciplina(row.get("Disciplina", "")),
+            str(row.get("Unidade", "")).strip().upper(),
+            str(row.get("Aula", "")).strip().upper(),
+        ))
+
+    novas_linhas = []
+    for _, row in df_base.iterrows():
+        chave = (
+            normalizar_chave_disciplina(row.get("Biblioteca", "")),
+            str(row.get("Unidade", "")).strip().upper(),
+            str(row.get("Aula", "")).strip().upper(),
+        )
+        if chave not in chaves_existentes:
+            base = {coluna: "" for coluna in COLUNAS_CONTROLE}
+            base["Biblioteca Original"] = row.get("Biblioteca Original", "")
+            base["Disciplina"] = row.get("Biblioteca", "")
+            base["Unidade"] = row.get("Unidade", "")
+            base["Aula"] = row.get("Aula", "")
+            base["Prazo"] = row.get("Prazo", "")
+            for etapa in COLUNAS_ETAPAS:
+                base[etapa] = "Não iniciado"
+            novas_linhas.append(base)
+            chaves_existentes.add(chave)
+
+    if novas_linhas:
+        controle = pd.concat(
+            [controle, pd.DataFrame(novas_linhas)],
+            ignore_index=True,
+        )
+
+    auditoria_por_chave = {}
+    for _, row in df_base.iterrows():
+        chave = (
+            normalizar_chave_disciplina(row.get("Biblioteca", "")),
+            str(row.get("Unidade", "")).strip().upper(),
+            str(row.get("Aula", "")).strip().upper(),
+        )
+        auditoria_por_chave[chave] = row
+
+    for indice, row in controle.iterrows():
+        chave = (
+            normalizar_chave_disciplina(row.get("Disciplina", "")),
+            str(row.get("Unidade", "")).strip().upper(),
+            str(row.get("Aula", "")).strip().upper(),
+        )
+        audit = auditoria_por_chave.get(chave)
+
+        if audit is None:
+            continue
+
+        # Não rebaixa status manual; apenas promove para Validado.
+        if _valor_ok(audit.get("DOCX", "")):
+            controle.at[indice, "Texto"] = "Validado"
+
+        if _valor_ok(audit.get("PDF", "")):
+            controle.at[indice, "Relatório Antiplágio"] = "Validado"
+
+        if _valor_ok(audit.get("PPT", "")):
+            controle.at[indice, "PPT"] = "Validado"
+
+        if _valor_ok(audit.get("Questões", "")):
+            controle.at[indice, "Questões"] = "Validado"
+
+    controle["Status da Produção"] = controle.apply(status_linha, axis=1)
+    return controle[COLUNAS_CONTROLE]
+
+
 def carregar_controle(
     df_base
 ):
 
     if not ARQUIVO_CONTROLE.exists():
 
-        return criar_controle_inicial(
+        controle = criar_controle_inicial(
             df_base
         )
+        controle = sincronizar_auditoria_controle(
+            controle,
+            df_base
+        )
+        controle = aplicar_responsaveis_controle(
+            controle,
+            carregar_responsaveis()
+        )
+        return controle[COLUNAS_CONTROLE]
 
     try:
 
         controle = pd.read_excel(
-            ARQUIVO_CONTROLE
+            ARQUIVO_CONTROLE,
+            engine="openpyxl"
         ).fillna("")
 
     except Exception as erro:
@@ -1655,8 +1918,22 @@ def carregar_controle(
     )
 
     # ------------------------------------------------------
-    # STATUS
+    # SINCRONIZA AUDITORIA -> CONTROLE
     # ------------------------------------------------------
+
+    controle = sincronizar_auditoria_controle(
+        controle,
+        df_base
+    )
+
+    # ------------------------------------------------------
+    # AUTOR / RESPONSÁVEL CADASTRADOS UMA ÚNICA VEZ
+    # ------------------------------------------------------
+
+    controle = aplicar_responsaveis_controle(
+        controle,
+        carregar_responsaveis()
+    )
 
     controle[
         "Status da Produção"
@@ -1760,7 +2037,8 @@ if arquivo is not None:
             BytesIO(
                 conteudo_arquivo
             ),
-            sheet_name="Auditoria"
+            sheet_name="Auditoria",
+            engine="openpyxl"
         )
 
         df_excel = df_excel.fillna("")
@@ -1915,12 +2193,33 @@ if ultima_importacao:
 # BIBLIOTECA ORIGINAL
 # ==========================================================
 
-df[
-    "Biblioteca Original"
-] = df[
-    "Biblioteca"
-].astype(
-    str
+# Usa o nome real da disciplina, quando o novo robô já o trouxe.
+# Isso elimina a dependência de Biblioteca 1, Biblioteca 2 etc.
+def _chave_biblioteca_original(row):
+    disciplina = str(row.get("Disciplina", "")).strip()
+
+    if (
+        disciplina
+        and not re.fullmatch(
+            r"Biblioteca\s*\d+",
+            disciplina,
+            flags=re.IGNORECASE
+        )
+    ):
+        return disciplina.upper()
+
+    biblioteca = str(row.get("Biblioteca", "")).strip()
+
+    if biblioteca:
+        return biblioteca
+
+    referencia = str(row.get("Biblioteca Ref", "")).strip()
+    return referencia
+
+
+df["Biblioteca Original"] = df.apply(
+    _chave_biblioteca_original,
+    axis=1
 )
 
 
@@ -2594,6 +2893,17 @@ with tab_producao:
         )
     )
 
+    # Sincroniza automaticamente os OK encontrados pela auditoria.
+    controle = sincronizar_auditoria_controle(
+        controle,
+        df
+    )
+
+    # Preenche Autor e Responsável cadastrados uma única vez.
+    controle = aplicar_responsaveis_controle(
+        controle,
+        carregar_responsaveis()
+    )
 
     controle[
         "Status da Produção"
@@ -2922,6 +3232,18 @@ with tab_producao:
         "_indice_original":
             None,
 
+        "Autor":
+            st.column_config.TextColumn(
+                "Autor",
+                disabled=True
+            ),
+
+        "Responsável":
+            st.column_config.TextColumn(
+                "Responsável",
+                disabled=True
+            ),
+
         "Prazo":
             st.column_config.TextColumn(
                 "Prazo",
@@ -3140,6 +3462,7 @@ with tab_producao:
                 [
                     "Disciplina",
                     "Autor",
+                    "Responsável",
                     "Revisor",
                     "Unidade",
                     "Aula",
@@ -3185,6 +3508,13 @@ with tab_config:
 
         st.markdown(
             "## 🏷️ Nomes das disciplinas"
+        )
+
+
+        st.caption(
+            "O dashboard prioriza automaticamente o nome da disciplina "
+            "recebido do SharePoint. O mapeamento manual permanece apenas "
+            "como fallback para relatórios antigos."
         )
 
 
@@ -3286,6 +3616,94 @@ with tab_config:
 
                 st.rerun()
 
+
+        st.divider()
+
+        # ======================================================
+        # AUTOR E RESPONSÁVEL POR DISCIPLINA
+        # ======================================================
+
+        st.markdown(
+            "## 👥 Autor e responsável por disciplina"
+        )
+
+        st.caption(
+            "Cadastre uma única vez. O dashboard reaplica automaticamente "
+            "Autor e Responsável a todas as aulas da disciplina."
+        )
+
+        cadastro_responsaveis = carregar_responsaveis()
+        linhas_responsaveis = []
+
+        for disciplina in disciplinas_unicas:
+            chave = normalizar_chave_disciplina(disciplina)
+            dados_resp = cadastro_responsaveis.get(chave, {})
+
+            if not isinstance(dados_resp, dict):
+                dados_resp = {}
+
+            linhas_responsaveis.append({
+                "Disciplina": disciplina,
+                "Autor/Revisor": str(dados_resp.get("autor", "")),
+                "Responsável": str(dados_resp.get("responsavel", "")),
+            })
+
+        df_responsaveis = pd.DataFrame(linhas_responsaveis)
+
+        editor_responsaveis = st.data_editor(
+            df_responsaveis,
+            column_config={
+                "Disciplina": st.column_config.TextColumn(
+                    "Disciplina",
+                    disabled=True,
+                ),
+                "Autor": st.column_config.TextColumn(
+                    "Autor",
+                ),
+                "Responsável": st.column_config.TextColumn(
+                    "Responsável",
+                ),
+            },
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            key="editor_responsaveis_disciplinas",
+        )
+
+        if st.button(
+            "💾 Salvar autor e responsável",
+            type="primary",
+            key="salvar_responsaveis_disciplinas",
+        ):
+            novo_cadastro = {}
+
+            for _, row_resp in editor_responsaveis.iterrows():
+                disciplina = str(row_resp.get("Disciplina", "")).strip()
+                if not disciplina:
+                    continue
+
+                chave = normalizar_chave_disciplina(disciplina)
+                novo_cadastro[chave] = {
+                    "autor": str(row_resp.get("Autor", "")).strip(),
+                    "responsavel": str(row_resp.get("Responsável", "")).strip(),
+                }
+
+            salvou_resp, destino_resp = salvar_responsaveis(novo_cadastro)
+
+            if salvou_resp:
+                if "controle_producao" in st.session_state:
+                    del st.session_state["controle_producao"]
+
+                if destino_resp == "github":
+                    st.success(
+                        "✅ Autor e responsável salvos no GitHub com sucesso."
+                    )
+                else:
+                    st.success(
+                        "✅ Autor e responsável salvos localmente."
+                    )
+
+                st.rerun()
 
         st.divider()
 
