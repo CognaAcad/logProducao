@@ -53,6 +53,10 @@ ARQUIVO_RESPONSAVEIS = Path(
     "responsaveis_disciplinas.json"
 )
 
+ARQUIVO_AJUSTES_AUDITORIA = Path(
+    "ajustes_auditoria.json"
+)
+
 
 # Link direto para download do arquivo de backup no GitHub.
 URL_BACKUP = (
@@ -1118,6 +1122,157 @@ def salvar_responsaveis(dados):
             f"Erro: {erro}"
         )
         return False, "erro"
+
+
+def carregar_ajustes_auditoria():
+
+    try:
+        return carregar_json_github(
+            "arquivo_ajustes_auditoria",
+            "ajustes_auditoria.json",
+            ARQUIVO_AJUSTES_AUDITORIA,
+        )
+    except Exception as erro:
+        st.warning(
+            "Não foi possível carregar os ajustes manuais da auditoria do GitHub. "
+            f"Será usada a cópia local, se existir. Erro: {erro}"
+        )
+        return carregar_json_local(ARQUIVO_AJUSTES_AUDITORIA)
+
+
+def salvar_ajustes_auditoria(dados):
+
+    try:
+        return salvar_json_github(
+            "arquivo_ajustes_auditoria",
+            "ajustes_auditoria.json",
+            ARQUIVO_AJUSTES_AUDITORIA,
+            dados,
+            "Atualiza checks manuais da auditoria pelo Streamlit",
+        )
+    except Exception as erro:
+        st.error(
+            "Não foi possível salvar os ajustes manuais da auditoria no GitHub. "
+            f"Erro: {erro}"
+        )
+        return False, "erro"
+
+
+def gerar_chave_ajuste_auditoria(biblioteca_original, unidade, aula):
+
+    return "|".join(
+        [
+            str(biblioteca_original).strip().upper(),
+            str(unidade).strip().upper(),
+            str(aula).strip().upper(),
+        ]
+    )
+
+
+def valor_entrega_ok(valor):
+
+    return str(valor).strip().upper() == "OK"
+
+
+def recalcular_status_entrega_inicial(row):
+    """Recalcula apenas a etapa inicial com base em DOCX/PPT/PDF.
+
+    Mantém estados posteriores (REV1, AJ1, Aprovado, Validado) vindos
+    do arquivo, mas corrige Incompleto/Entrega inicial completa quando
+    houver ajuste manual dos checks iniciais.
+    """
+
+    campos_iniciais = ["DOCX", "PPT", "PDF"]
+    faltantes = [
+        campo
+        for campo in campos_iniciais
+        if not valor_entrega_ok(row.get(campo, ""))
+    ]
+
+    status_atual = str(row.get("Status Geral", "")).strip()
+    status_lower = status_atual.lower()
+
+    status_posterior = any(
+        termo in status_lower
+        for termo in [
+            "revis",
+            "ajuste",
+            "aprov",
+            "valid",
+        ]
+    )
+
+    if not status_posterior:
+        if faltantes:
+            row["Status Geral"] = "Incompleto"
+        else:
+            row["Status Geral"] = "Entrega inicial completa"
+
+    pendencias_atual = [
+        item.strip()
+        for item in str(row.get("Pendências", "")).split(",")
+        if item.strip()
+    ]
+
+    # Remove apenas as pendências das três entregas iniciais e as recompõe.
+    pendencias_restantes = [
+        item
+        for item in pendencias_atual
+        if item.upper() not in {"DOCX", "PPT", "PDF"}
+    ]
+
+    row["Pendências"] = ", ".join(
+        faltantes + pendencias_restantes
+    )
+
+    return row
+
+
+def aplicar_ajustes_auditoria(df_auditoria, ajustes):
+    """Aplica correções manuais sem impedir a leitura automática do arquivo.
+
+    O valor OK vindo do arquivo sempre é respeitado. Quando o arquivo ainda
+    informa FALTANDO/Não identificado, o ajuste manual pode promover para OK.
+    """
+
+    if df_auditoria is None or df_auditoria.empty:
+        return df_auditoria
+
+    resultado = df_auditoria.copy()
+    colunas_editaveis = ["DOCX", "PPT", "PDF", "Questões"]
+
+    # Preserva o valor efetivamente recebido do arquivo para distinguir
+    # o input automático do eventual override manual da interface.
+    for coluna in colunas_editaveis:
+        resultado[f"__arquivo_{coluna}"] = resultado[coluna].astype(str)
+
+    for indice, row in resultado.iterrows():
+        chave = gerar_chave_ajuste_auditoria(
+            row.get("Biblioteca Original", ""),
+            row.get("Unidade", ""),
+            row.get("Aula", ""),
+        )
+
+        registro = ajustes.get(chave, {})
+        if not isinstance(registro, dict):
+            registro = {}
+
+        for coluna in colunas_editaveis:
+            valor_arquivo = str(row.get(coluna, "")).strip()
+            valor_manual = str(registro.get(coluna, "")).strip()
+
+            # A auditoria automática tem prioridade quando já encontrou OK.
+            if valor_entrega_ok(valor_arquivo):
+                resultado.at[indice, coluna] = "OK"
+            elif valor_manual:
+                resultado.at[indice, coluna] = valor_manual
+
+    resultado = resultado.apply(
+        recalcular_status_entrega_inicial,
+        axis=1,
+    )
+
+    return resultado
 
 
 def normalizar_chave_disciplina(valor):
@@ -2258,6 +2413,14 @@ df = aplicar_mapeamento(
     tabela_mapeamento
 )
 
+# Aplica os checks manuais persistidos sem perder os OK encontrados
+# automaticamente pelo arquivo de auditoria.
+ajustes_auditoria = carregar_ajustes_auditoria()
+df = aplicar_ajustes_auditoria(
+    df,
+    ajustes_auditoria
+)
+
 
 # ==========================================================
 # CRONOGRAMA
@@ -2819,6 +2982,7 @@ with tab_auditoria:
     ]
 
 
+    # Mantém a visualização original com os fundos coloridos.
     st.dataframe(
         df_filtrado[
             colunas_visao
@@ -2826,8 +2990,158 @@ with tab_auditoria:
             destacar_status
         ),
         use_container_width=True,
-        height=450
+        height=450,
     )
+
+    st.caption(
+        "Os fundos coloridos continuam refletindo o status consolidado. "
+        "Para corrigir manualmente um check identificado como FALTANDO, "
+        "use o editor abaixo. Os valores OK encontrados automaticamente "
+        "pelo arquivo de auditoria continuam tendo prioridade."
+    )
+
+    with st.expander(
+        "✏️ Editar checks de entrega",
+        expanded=False,
+    ):
+        visao_editavel = df_filtrado[
+            [
+                "Biblioteca",
+                "Unidade",
+                "Aula",
+                "DOCX",
+                "PPT",
+                "PDF",
+                "Questões",
+            ]
+        ].copy()
+
+        visao_editavel["_indice_original"] = df_filtrado.index
+
+        config_visao = {
+            "_indice_original": None,
+            "Biblioteca": st.column_config.TextColumn(
+                "Biblioteca",
+                disabled=True,
+            ),
+            "Unidade": st.column_config.TextColumn(
+                "Unidade",
+                disabled=True,
+            ),
+            "Aula": st.column_config.TextColumn(
+                "Aula",
+                disabled=True,
+            ),
+            "DOCX": st.column_config.SelectboxColumn(
+                "DOCX",
+                options=["", "OK", "FALTANDO", "Não identificado"],
+                required=True,
+            ),
+            "PPT": st.column_config.SelectboxColumn(
+                "PPT",
+                options=["", "OK", "FALTANDO", "Não identificado"],
+                required=True,
+            ),
+            "PDF": st.column_config.SelectboxColumn(
+                "PDF",
+                options=["", "OK", "FALTANDO", "Não identificado"],
+                required=True,
+            ),
+            "Questões": st.column_config.SelectboxColumn(
+                "Questões",
+                options=["", "OK", "FALTANDO", "Não identificado"],
+                required=True,
+            ),
+        }
+
+        visao_editada = st.data_editor(
+            visao_editavel,
+            column_config=config_visao,
+            use_container_width=True,
+            hide_index=True,
+            height=360,
+            num_rows="fixed",
+            key="editor_visao_rapida_auditoria",
+        )
+
+        if st.button(
+            "💾 Salvar checks manuais",
+            type="primary",
+            key="salvar_checks_manuais_auditoria",
+        ):
+            novos_ajustes = carregar_ajustes_auditoria()
+
+            for _, linha_editada in visao_editada.iterrows():
+                indice_original = int(
+                    linha_editada["_indice_original"]
+                )
+
+                linha_base = df.loc[indice_original]
+                chave = gerar_chave_ajuste_auditoria(
+                    linha_base.get("Biblioteca Original", ""),
+                    linha_base.get("Unidade", ""),
+                    linha_base.get("Aula", ""),
+                )
+
+                registro = novos_ajustes.get(chave, {})
+                if not isinstance(registro, dict):
+                    registro = {}
+
+                for coluna in ["DOCX", "PPT", "PDF", "Questões"]:
+                    valor_arquivo = str(
+                        linha_base.get(
+                            f"__arquivo_{coluna}",
+                            linha_base.get(coluna, ""),
+                        )
+                    ).strip()
+                    valor_editado = str(
+                        linha_editada.get(coluna, "")
+                    ).strip()
+
+                    # O arquivo de auditoria tem prioridade quando já encontrou OK.
+                    if valor_entrega_ok(valor_arquivo):
+                        registro.pop(coluna, None)
+                        continue
+
+                    # Caso o arquivo ainda não tenha OK, mantém a correção manual.
+                    if valor_editado and valor_editado != valor_arquivo:
+                        registro[coluna] = valor_editado
+                    else:
+                        registro.pop(coluna, None)
+
+                registro["ultima_atualizacao"] = datetime.now().strftime(
+                    "%d/%m/%Y %H:%M:%S"
+                )
+
+                campos_status = [
+                    valor
+                    for chave_registro, valor in registro.items()
+                    if chave_registro != "ultima_atualizacao"
+                    and str(valor).strip()
+                ]
+
+                if campos_status:
+                    novos_ajustes[chave] = registro
+                else:
+                    novos_ajustes.pop(chave, None)
+
+            salvou_ajustes, destino_ajustes = salvar_ajustes_auditoria(
+                novos_ajustes
+            )
+
+            if salvou_ajustes:
+                if destino_ajustes == "github":
+                    st.success(
+                        "✅ Checks manuais salvos no GitHub. "
+                        "A leitura automática do arquivo continua ativa."
+                    )
+                else:
+                    st.success(
+                        "✅ Checks manuais salvos localmente. "
+                        "A leitura automática do arquivo continua ativa."
+                    )
+
+                st.rerun()
 
 
     # ======================================================
@@ -3663,7 +3977,7 @@ with tab_config:
 
             linhas_responsaveis.append({
                 "Disciplina": disciplina,
-                "Autor/Revisor": str(dados_resp.get("autor", "")),
+                "Autor": str(dados_resp.get("autor", "")),
                 "Responsável": str(dados_resp.get("responsavel", "")),
             })
 
